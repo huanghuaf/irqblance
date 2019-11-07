@@ -39,51 +39,27 @@
 
 GList *numa_nodes = NULL;
 
-static struct topo_obj unspecified_node_template = {
-	.load = 0,
-	.number = -1,
-	.obj_type = OBJ_TYPE_NODE,
-	.mask = CPU_MASK_ALL,
-	.interrupts = NULL,
-	.children = NULL,
-	.parent = NULL,
-	.obj_type_list = &numa_nodes,
-};
-
-static struct topo_obj unspecified_node;
-
-static void add_one_node(const char *nodename)
+static void add_one_node(int nodeid)
 {
 	char path[PATH_MAX];
 	struct topo_obj *new;
-	char *cpustr = NULL;
-	FILE *f;
-	ssize_t ret;
-	size_t blen;
 
 	new = calloc(1, sizeof(struct topo_obj));
-	if (!new)
-		return;
-	sprintf(path, "%s/%s/cpumap", SYSFS_NODE_PATH, nodename);
-	f = fopen(path, "r");
-	if (!f) {
-		free(new);
+	if (!new) {
+		need_rebuild = 1;
 		return;
 	}
-	if (ferror(f)) {
-		cpus_clear(new->mask);
+
+	if (nodeid == NUMA_NO_NODE) {
+		cpus_setall(new->mask);
 	} else {
-		ret = getline(&cpustr, &blen, f);
-		if (ret <= 0) {
-			cpus_clear(new->mask);
-		} else {
-			cpumask_parse_user(cpustr, ret, new->mask);
-			free(cpustr);
-		}
+		cpus_clear(new->mask);
+		sprintf(path, "%s/node%d/cpumap", SYSFS_NODE_PATH, nodeid);
+		process_one_line(path, get_mask_from_bitmap, &new->mask);
 	}
-	fclose(f);
+
 	new->obj_type = OBJ_TYPE_NODE;	
-	new->number = strtoul(&nodename[4], NULL, 10);
+	new->number = nodeid;
 	new->obj_type_list = &numa_nodes;
 	numa_nodes = g_list_append(numa_nodes, new);
 }
@@ -93,17 +69,8 @@ void build_numa_node_list(void)
 	DIR *dir;
 	struct dirent *entry;
 
-	/*
-	 * Note that we copy the unspcified node from the template here
-	 * in the event we just freed the object tree during a rescan.
-	 * This ensures we don't get stale list pointers anywhere
-	 */
-	memcpy(&unspecified_node, &unspecified_node_template, sizeof (struct topo_obj));
-
-	/*
-	 * Add the unspecified node
-	 */
-	numa_nodes = g_list_append(numa_nodes, &unspecified_node);
+	/* Add the unspecified node */
+	add_one_node(NUMA_NO_NODE);
 
 	if (!numa_avail)
 		return;
@@ -119,25 +86,15 @@ void build_numa_node_list(void)
 		if ((entry->d_type == DT_DIR) &&
 		    (strncmp(entry->d_name, "node", 4) == 0) &&
 		    isdigit(entry->d_name[4])) {
-			add_one_node(entry->d_name);
+			add_one_node(strtoul(&entry->d_name[4], NULL, 10));
 		}
 	} while (entry);
 	closedir(dir);
 }
 
-static void free_numa_node(gpointer data)
-{
-	struct topo_obj *obj = data;
-	g_list_free(obj->children);
-	g_list_free(obj->interrupts);
-
-	if (data != &unspecified_node)
-		free(data);
-}
-
 void free_numa_node_list(void)
 {
-	g_list_free_full(numa_nodes, free_numa_node);
+	g_list_free_full(numa_nodes, free_cpu_topo);
 	numa_nodes = NULL;
 }
 
@@ -153,7 +110,6 @@ void connect_cpu_mem_topo(struct topo_obj *p, void *data __attribute__((unused))
 {
 	GList *entry;
 	struct topo_obj *node;
-	struct topo_obj *lchild;
 	int len;
 
 	len = g_list_length(p->numa_nodes);
@@ -171,14 +127,7 @@ void connect_cpu_mem_topo(struct topo_obj *p, void *data __attribute__((unused))
 	if (p->obj_type == OBJ_TYPE_PACKAGE && !p->parent)
 		p->parent = node;
 
-	entry = g_list_first(node->children);
-	while (entry) {
-		lchild = entry->data;
-		if (lchild == p)
-			break;
-		entry = g_list_next(entry);
-	}
-
+	entry = g_list_find(node->children, p);
 	if (!entry)
 		node->children = g_list_append(node->children, p);
 }
@@ -198,13 +147,7 @@ struct topo_obj *get_numa_node(int nodeid)
 	struct topo_obj find;
 	GList *entry;
 
-	if (!numa_avail)
-		return &unspecified_node;
-
-	if (nodeid == -1)
-		return &unspecified_node;
-
-	find.number = nodeid;
+	find.number = numa_avail ? nodeid : NUMA_NO_NODE;
 
 	entry = g_list_find_custom(numa_nodes, &find, compare_node);
 	return entry ? entry->data : NULL;

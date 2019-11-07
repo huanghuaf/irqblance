@@ -52,6 +52,7 @@ int foreground_mode;
 int numa_avail;
 int journal_logging = 0;
 int need_rescan;
+int need_rebuild;
 unsigned int log_mask = TO_ALL;
 const char *log_indent;
 unsigned long power_thresh = ULONG_MAX;
@@ -260,14 +261,25 @@ gboolean scan(gpointer data __attribute__((unused)))
 
 
 	/* cope with cpu hotplug -- detected during /proc/interrupts parsing */
-	if (need_rescan) {
+	if (need_rescan || need_rebuild) {
+		int try_times = 0;
+
 		need_rescan = 0;
 		cycle_count = 0;
 		log(TO_CONSOLE, LOG_INFO, "Rescanning cpu topology \n");
 		clear_work_stats();
 
-		free_object_tree();
-		build_object_tree();
+		do {
+			free_object_tree();
+			if (++try_times > 3) {
+				log(TO_CONSOLE, LOG_WARNING, "Rescanning cpu topology: fail\n");
+				goto out;
+			}
+
+			need_rebuild = 0;
+			build_object_tree();
+		} while (need_rebuild);
+
 		for_each_irq(NULL, force_rebalance_irq, NULL);
 		parse_proc_interrupts();
 		parse_proc_stat();
@@ -284,6 +296,7 @@ gboolean scan(gpointer data __attribute__((unused)))
 	calculate_placement();
 	activate_mappings();
 
+out:
 	if (debug_mode)
 		dump_tree();
 	if (one_shot_mode)
@@ -308,10 +321,17 @@ gboolean scan(gpointer data __attribute__((unused)))
 void get_irq_data(struct irq_info *irq, void *data)
 {
 	char **irqdata = (char **)data;
+	char *newptr = NULL;
+
 	if (!*irqdata)
-		*irqdata = calloc(24 + 1 + 11 + 20 + 20 + 11, 1);
+		newptr = calloc(24 + 1 + 11 + 20 + 20 + 11, 1);
 	else
-		*irqdata = realloc(*irqdata, strlen(*irqdata) + 24 + 1 + 11 + 20 + 20 + 11);
+		newptr = realloc(*irqdata, strlen(*irqdata) + 24 + 1 + 11 + 20 + 20 + 11);
+
+	if (!newptr)
+		return;
+
+	*irqdata = newptr;
 
 	sprintf(*irqdata + strlen(*irqdata),
 			"IRQ %d LOAD %lu DIFF %lu CLASS %d ", irq->irq, irq->load,
@@ -322,6 +342,7 @@ void get_object_stat(struct topo_obj *object, void *data)
 {
 	char **stats = (char **)data;	
 	char *irq_data = NULL;
+	char *newptr = NULL;
 	size_t irqdlen;
 
 	if (g_list_length(object->interrupts) > 0) {
@@ -339,10 +360,17 @@ void get_object_stat(struct topo_obj *object, void *data)
 	 * This should be adjusted if the string in the sprintf is changed
 	 */
 	if (!*stats) {
-		*stats = calloc(irqdlen + 31 + 11 + 20 + 11 + 1, 1);
+		newptr = calloc(irqdlen + 31 + 11 + 20 + 11 + 1, 1);
 	} else {
-		*stats = realloc(*stats, strlen(*stats) + irqdlen + 31 + 11 + 20 + 11 + 1);
+		newptr = realloc(*stats, strlen(*stats) + irqdlen + 31 + 11 + 20 + 11 + 1);
 	}
+
+	if (!newptr) {
+		free(irq_data);
+		return;
+	}
+
+	*stats = newptr;
 
 	sprintf(*stats + strlen(*stats), "TYPE %d NUMBER %d LOAD %lu SAVE_MODE %d %s",
 			object->obj_type, object->number, object->load,
@@ -380,6 +408,10 @@ gboolean sock_handle(gint fd, GIOCondition condition, gpointer user_data __attri
 			goto out_close;
 		}
 		cmsg = CMSG_FIRSTHDR(&msg);
+		if (!cmsg) {
+			log(TO_ALL, LOG_WARNING, "Connection no memory.\n");
+			goto out_close;
+		}
 		if ((cmsg->cmsg_level == SOL_SOCKET) &&
 				(cmsg->cmsg_type == SCM_CREDENTIALS)) {
 			struct ucred *credentials = (struct ucred *) CMSG_DATA(cmsg);
@@ -403,6 +435,9 @@ gboolean sock_handle(gint fd, GIOCondition condition, gpointer user_data __attri
 							strlen("sleep ")))) {
 				char *sleep_string = malloc(
 						sizeof(char) * (recv_size - strlen("settings sleep ")));
+
+				if (!sleep_string)
+					goto out_close;
 				strncpy(sleep_string, buff + strlen("settings sleep "),
 						recv_size - strlen("settings sleep "));
 				int new_iterval = strtoul(sleep_string, NULL, 10);
@@ -415,6 +450,9 @@ gboolean sock_handle(gint fd, GIOCondition condition, gpointer user_data __attri
 				char *end;
 				char *irq_string = malloc(
 						sizeof(char) * (recv_size - strlen("settings ban irqs ")));
+
+				if (!irq_string)
+					goto out_close;
 				strncpy(irq_string, buff + strlen("settings ban irqs "),
 						recv_size - strlen("settings ban irqs "));
 				g_list_free_full(cl_banned_irqs, free);
@@ -433,6 +471,9 @@ gboolean sock_handle(gint fd, GIOCondition condition, gpointer user_data __attri
 							strlen("cpus")))) {
 				char *cpu_ban_string = malloc(
 						sizeof(char) * (recv_size - strlen("settings cpus ")));
+
+				if (!cpu_ban_string)
+					goto out_close;
 				strncpy(cpu_ban_string, buff + strlen("settings cpus "),
 						recv_size - strlen("settings cpus "));
 				banned_cpumask_from_ui = strtok(cpu_ban_string, " ");
@@ -446,15 +487,24 @@ gboolean sock_handle(gint fd, GIOCondition condition, gpointer user_data __attri
 		if (!strncmp(buff, "setup", strlen("setup"))) {
 			char banned[512];
 			char *setup = calloc(strlen("SLEEP  ") + 11 + 1, 1);
+			char *newptr = NULL;
+
+			if (!setup)
+				goto out_close;
 			snprintf(setup, strlen("SLEEP  ") + 11 + 1, "SLEEP %d ", sleep_interval);
 			if(g_list_length(cl_banned_irqs) > 0) {
-				for_each_irq(cl_banned_irqs, get_irq_data, setup);
+				for_each_irq(cl_banned_irqs, get_irq_data, &setup);
 			}
 			cpumask_scnprintf(banned, 512, banned_cpus);
-			setup = realloc(setup, strlen(setup) + strlen(banned) + 7 + 1);
+			newptr = realloc(setup, strlen(setup) + strlen(banned) + 7 + 1);
+			if (!newptr)
+				goto out_free_setup;
+
+			setup = newptr;
 			snprintf(setup + strlen(setup), strlen(banned) + 7 + 1,
 					"BANNED %s", banned);
 			send(sock, setup, strlen(setup), 0);
+out_free_setup:
 			free(setup);
 		}
 
@@ -510,6 +560,7 @@ int init_socket()
 int main(int argc, char** argv)
 {
 	sigset_t sigset, old_sigset;
+	int ret = EXIT_SUCCESS;
 
 	sigemptyset(&sigset);
 	sigaddset(&sigset,SIGINT);
@@ -573,26 +624,12 @@ int main(int argc, char** argv)
 		log(TO_ALL, LOG_WARNING, "Unable to determin HZ defaulting to 100\n");
 		HZ = 100;
 	}
-
-	build_object_tree();
-	if (debug_mode)
-		dump_object_tree();
-
-
-	/* On single core UP systems irqbalance obviously has no work to do */
-	if (core_count<2) {
-		char *msg = "Balancing is ineffective on systems with a "
-			    "single cpu.  Shutting down\n";
-
-		log(TO_ALL, LOG_WARNING, "%s", msg);
-		exit(EXIT_SUCCESS);
-	}
-
+	
 	if (!foreground_mode) {
 		int pidfd = -1;
 		if (daemon(0,0))
 			exit(EXIT_FAILURE);
-		/* Write pidfile */
+		/* Write pidfile which can be used to avoid starting mutiple instances */
 		if (pidfile && (pidfd = open(pidfile,
 			O_WRONLY | O_CREAT | O_EXCL | O_TRUNC,
 			S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)) >= 0) {
@@ -602,6 +639,21 @@ int main(int argc, char** argv)
 			close(pidfd);
 		}
 	}
+
+	build_object_tree();
+	if (debug_mode)
+		dump_object_tree();
+
+
+	/* On single core UP systems irqbalance obviously has no work to do */
+	if (num_online_cpus() <= 1) {
+		char *msg = "Balancing is ineffective on systems with a "
+			    "single cpu.  Shutting down\n";
+
+		log(TO_ALL, LOG_WARNING, "%s", msg);
+		goto out;
+	}
+
 
 	g_unix_signal_add(SIGINT, handler, NULL);
 	g_unix_signal_add(SIGTERM, handler, NULL);
@@ -622,7 +674,8 @@ int main(int argc, char** argv)
 	parse_proc_stat();
 
 	if (init_socket()) {
-		return EXIT_FAILURE;
+		ret = EXIT_FAILURE;
+		goto out;
 	}
 	main_loop = g_main_loop_new(NULL, FALSE);
 	last_interval = sleep_interval;
@@ -631,6 +684,7 @@ int main(int argc, char** argv)
 
 	g_main_loop_quit(main_loop);
 
+out:
 	free_object_tree();
 	free_cl_opts();
 
@@ -638,9 +692,10 @@ int main(int argc, char** argv)
 	if (!foreground_mode && pidfile)
 		unlink(pidfile);
 	/* Remove socket */
-	close(socket_fd);
+	if (socket_fd > 0)
+		close(socket_fd);
 	if (socket_name[0])
 		unlink(socket_name);
 
-	return EXIT_SUCCESS;
+	return ret;
 }

@@ -44,20 +44,49 @@ GList *cpus;
 GList *cache_domains;
 GList *packages;
 
-int package_count;
 int cache_domain_count;
-int core_count;
 
 /* Users want to be able to keep interrupts away from some cpus; store these in a cpumask_t */
 cpumask_t banned_cpus;
 
-cpumask_t cpu_possible_map;
+cpumask_t cpu_online_map;
 
 /* 
    it's convenient to have the complement of banned_cpus available so that 
    the AND operator can be used to mask out unwanted cpus
 */
 cpumask_t unbanned_cpus;
+
+int process_one_line(char *path, void (*cb)(char *line, void *data), void *data)
+{
+	FILE *file;
+	char *line = NULL;
+	size_t size = 0;
+	int ret = -1;
+
+	file = fopen(path, "r");
+	if (!file)
+		return ret;
+
+	if (getline(&line, &size, file) > 0) {
+		cb(line, data);
+		ret = 0;
+	}
+	free(line);
+	fclose(file);
+	return ret;
+}
+
+void get_mask_from_bitmap(char *line, void *mask)
+{
+	cpumask_parse_user(line, strlen(line), *(cpumask_t *)mask);
+}
+
+static void get_mask_from_cpulist(char *line, void *mask)
+{
+	if (strlen(line) && line[0] != '\n')
+		cpulist_parse(line, strlen(line), *(cpumask_t *)mask);
+}
 
 /*
  * By default do not place IRQs on CPUs the kernel keeps isolated or
@@ -66,9 +95,7 @@ cpumask_t unbanned_cpus;
  */
 static void setup_banned_cpus(void)
 {
-	FILE *file;
-	char *line = NULL;
-	size_t size = 0;
+	char *path = NULL;
 	char buffer[4096];
 	cpumask_t nohz_full;
 	cpumask_t isolated_cpus;
@@ -86,29 +113,12 @@ static void setup_banned_cpus(void)
 		cpumask_parse_user(getenv("IRQBALANCE_BANNED_CPUS"), strlen(getenv("IRQBALANCE_BANNED_CPUS")), banned_cpus);
 		goto out;
 	}
-	file = fopen("/sys/devices/system/cpu/isolated", "r");
-	if (file) {
-		if (getline(&line, &size, file) > 0) {
-			if (strlen(line) && line[0] != '\n')
-				cpulist_parse(line, strlen(line), isolated_cpus);
-			free(line);
-			line = NULL;
-			size = 0;
-		}
-		fclose(file);
-	}
 
-	file = fopen("/sys/devices/system/cpu/nohz_full", "r");
-	if (file) {
-		if (getline(&line, &size, file) > 0) {
-			if (strlen(line) && line[0] != '\n')
-				cpulist_parse(line, strlen(line), nohz_full);
-			free(line);
-			line = NULL;
-			size = 0;
-		}
-		fclose(file);
-	}
+	path = "/sys/devices/system/cpu/isolated";
+	process_one_line(path, get_mask_from_cpulist, &isolated_cpus);
+
+	path = "/sys/devices/system/cpu/nohz_full";
+	process_one_line(path, get_mask_from_cpulist, &nohz_full);
 
 	cpus_or(banned_cpus, nohz_full, isolated_cpus);
 
@@ -125,33 +135,17 @@ static void add_numa_node_to_topo_obj(struct topo_obj *obj, int nodeid)
 {
 	GList *entry;
 	struct topo_obj *node;
-	struct topo_obj *cand_node;
-	struct topo_obj *package;
 
 	node = get_numa_node(nodeid);
-	if (!node || (numa_avail && (node->number == -1)))
+	if (!node || (numa_avail && (node->number == NUMA_NO_NODE)))
 		return;
 
-	entry = g_list_first(obj->numa_nodes);
-	while (entry) {
-		cand_node = entry->data;
-		if (cand_node == node)
-			break;
-		entry = g_list_next(entry);
-	}
-
+	entry = g_list_find(obj->numa_nodes, node);
 	if (!entry)
 		obj->numa_nodes = g_list_append(obj->numa_nodes, node);
 
 	if (!numa_avail && obj->obj_type == OBJ_TYPE_PACKAGE) {
-		entry = g_list_first(node->children);
-		while (entry) {
-			package = entry->data;
-			if (package == obj)
-				break;
-			entry = g_list_next(entry);
-		}
-
+		entry = g_list_find(node->children, obj);
 		if (!entry) {
 			node->children = g_list_append(node->children, obj);
 			obj->parent = node;
@@ -166,7 +160,6 @@ static struct topo_obj* add_cache_domain_to_package(struct topo_obj *cache,
 {
 	GList *entry;
 	struct topo_obj *package;
-	struct topo_obj *lcache; 
 
 	entry = g_list_first(packages);
 
@@ -181,31 +174,25 @@ static struct topo_obj* add_cache_domain_to_package(struct topo_obj *cache,
 	}
 
 	if (!entry) {
-		package = calloc(sizeof(struct topo_obj), 1);
-		if (!package)
+		package = calloc(1, sizeof(struct topo_obj));
+		if (!package) {
+			need_rebuild = 1;
 			return NULL;
+		}
 		package->mask = package_mask;
 		package->obj_type = OBJ_TYPE_PACKAGE;
 		package->obj_type_list = &packages;
 		package->number = packageid;
 		packages = g_list_append(packages, package);
-		package_count++;
 	}
 
-	entry = g_list_first(package->children);
-	while (entry) {
-		lcache = entry->data;
-		if (lcache == cache)
-			break;
-		entry = g_list_next(entry);
-	}
-
+	entry = g_list_find(package->children, cache);
 	if (!entry) {
 		package->children = g_list_append(package->children, cache);
 		cache->parent = package;
 	}
 
-	if (!numa_avail || (nodeid > -1))
+	if (!numa_avail || (nodeid > NUMA_NO_NODE))
 		add_numa_node_to_topo_obj(package, nodeid);
 
 	return package;
@@ -216,7 +203,6 @@ static struct topo_obj* add_cpu_to_cache_domain(struct topo_obj *cpu,
 {
 	GList *entry;
 	struct topo_obj *cache;
-	struct topo_obj *lcpu;
 
 	entry = g_list_first(cache_domains);
 
@@ -228,9 +214,11 @@ static struct topo_obj* add_cpu_to_cache_domain(struct topo_obj *cpu,
 	}
 
 	if (!entry) {
-		cache = calloc(sizeof(struct topo_obj), 1);
-		if (!cache)
+		cache = calloc(1, sizeof(struct topo_obj));
+		if (!cache) {
+			need_rebuild = 1;
 			return NULL;
+		}
 		cache->obj_type = OBJ_TYPE_CACHE;
 		cache->mask = cache_mask;
 		cache->number = cache_domain_count;
@@ -239,30 +227,36 @@ static struct topo_obj* add_cpu_to_cache_domain(struct topo_obj *cpu,
 		cache_domain_count++;
 	}
 
-	entry = g_list_first(cache->children);
-	while (entry) {
-		lcpu = entry->data;
-		if (lcpu == cpu)
-			break;
-		entry = g_list_next(entry);
-	}
-
+	entry = g_list_find(cache->children, cpu);
 	if (!entry) {
 		cache->children = g_list_append(cache->children, cpu);
 		cpu->parent = (struct topo_obj *)cache;
 	}
 
-	if (!numa_avail || (nodeid > -1))
+	if (!numa_avail || (nodeid > NUMA_NO_NODE))
 		add_numa_node_to_topo_obj(cache, nodeid);
 
 	return cache;
+}
+
+static void get_offline_status(char *line, void *data)
+{
+	int *status = (int *)data;
+
+	*status = (line && line[0] == '0') ? 1 : 0;
+}
+
+static void get_packageid(char *line, void *data)
+{
+	int *packageid = (int *)data;
+
+	*packageid = strtoul(line, NULL, 10);
 }
 
 #define ADJ_SIZE(r,s) PATH_MAX-strlen(r)-strlen(#s) 
 static void do_one_cpu(char *path)
 {
 	struct topo_obj *cpu;
-	FILE *file;
 	char new_path[PATH_MAX];
 	cpumask_t cache_mask, package_mask;
 	struct topo_obj *cache;
@@ -271,32 +265,25 @@ static void do_one_cpu(char *path)
 	int nodeid;
 	int packageid = 0;
 	unsigned int max_cache_index, cache_index, cache_stat;
+	int offline_status = 0;
 
 	/* skip offline cpus */
 	snprintf(new_path, ADJ_SIZE(path,"/online"), "%s/online", path);
-	file = fopen(new_path, "r");
-	if (file) {
-		char *line = NULL;
-		size_t size = 0;
-		if (getline(&line, &size, file)==0)
-			return;
-		fclose(file);
-		if (line && line[0]=='0') {
-			free(line);
-			return;
-		}
-		free(line);
-	}
-
-	cpu = calloc(sizeof(struct topo_obj), 1);
-	if (!cpu)
+	process_one_line(new_path, get_offline_status, &offline_status);
+	if (offline_status)
 		return;
+
+	cpu = calloc(1, sizeof(struct topo_obj));
+	if (!cpu) {
+		need_rebuild = 1;
+		return;
+	}
 
 	cpu->obj_type = OBJ_TYPE_CPU;
 
 	cpu->number = strtoul(&path[27], NULL, 10);
 
-	cpu_set(cpu->number, cpu_possible_map);
+	cpu_set(cpu->number, cpu_online_map);
 	
 	cpu_set(cpu->number, cpu->mask);
 
@@ -309,41 +296,24 @@ static void do_one_cpu(char *path)
 	/* if the cpu is on the banned list, just don't add it */
 	if (cpus_intersects(cpu->mask, banned_cpus)) {
 		free(cpu);
-		/* even though we don't use the cpu we do need to count it */
-		core_count++;
 		return;
 	}
-
 
 	/* try to read the package mask; if it doesn't exist assume solitary */
 	snprintf(new_path, ADJ_SIZE(path, "/topology/core_siblings"),
 		 "%s/topology/core_siblings", path);
-	file = fopen(new_path, "r");
-	cpu_set(cpu->number, package_mask);
-	if (file) {
-		char *line = NULL;
-		size_t size = 0;
-		if (getline(&line, &size, file)) 
-			cpumask_parse_user(line, strlen(line), package_mask);
-		fclose(file);
-		free(line);
+	if (process_one_line(new_path, get_mask_from_bitmap, &package_mask)) {
+		cpus_clear(package_mask);
+		cpu_set(cpu->number, package_mask);
 	}
+
 	/* try to read the package id */
 	snprintf(new_path, ADJ_SIZE(path, "/topology/physical_package_id"),
 		 "%s/topology/physical_package_id", path);
-	file = fopen(new_path, "r");
-	if (file) {
-		char *line = NULL;
-		size_t size = 0;
-		if (getline(&line, &size, file))
-			packageid = strtoul(line, NULL, 10);
-		fclose(file);
-		free(line);
-	}
+	process_one_line(new_path, get_packageid, &packageid);
 
 	/* try to read the cache mask; if it doesn't exist assume solitary */
 	/* We want the deepest cache level available */
-	cpu_set(cpu->number, cache_mask);
 	max_cache_index = 0;
 	cache_index = 1;
 	do {
@@ -364,18 +334,10 @@ static void do_one_cpu(char *path)
 		/* Extra 10 subtraction is for the max character length of %d */
 		snprintf(new_path, ADJ_SIZE(path, "/cache/index%d/shared_cpu_map") - 10,
 			 "%s/cache/index%d/shared_cpu_map", path, max_cache_index);
-		file = fopen(new_path, "r");
-		if (file) {
-			char *line = NULL;
-			size_t size = 0;
-			if (getline(&line, &size, file))
-				cpumask_parse_user(line, strlen(line), cache_mask);
-			fclose(file);
-			free(line);
-		}
+		process_one_line(new_path, get_mask_from_bitmap, &cache_mask);
 	}
 
-	nodeid=-1;
+	nodeid = NUMA_NO_NODE;
 	if (numa_avail) {
 		struct topo_obj *node;
 
@@ -413,12 +375,11 @@ static void do_one_cpu(char *path)
 	cpus_and(package_mask, package_mask, unbanned_cpus);
 
 	cache = add_cpu_to_cache_domain(cpu, cache_mask, nodeid);
-	add_cache_domain_to_package(cache, packageid, package_mask,
-	    nodeid);
+	if (cache)
+		add_cache_domain_to_package(cache, packageid, package_mask, nodeid);
 
 	cpu->obj_type_list = &cpus;
 	cpus = g_list_append(cpus, cpu);
-	core_count++;
 }
 
 static void dump_irq(struct irq_info *info, void *data)
@@ -427,6 +388,8 @@ static void dump_irq(struct irq_info *info, void *data)
 	int i;
 	char * indent = malloc (sizeof(char) * (spaces + 1));
 
+	if (!indent)
+		return;
 	for ( i = 0; i < spaces; i++ )
 		indent[i] = log_indent[0];
 
@@ -545,6 +508,15 @@ void parse_cpu_tree(void)
 
 }
 
+void free_cpu_topo(gpointer data)
+{
+	struct topo_obj *obj = data;
+
+	g_list_free(obj->children);
+	g_list_free(obj->interrupts);
+	g_list_free(obj->numa_nodes);
+	free(obj);
+}
 
 /*
  * This function frees all memory related to a cpu tree so that a new tree
@@ -552,43 +524,16 @@ void parse_cpu_tree(void)
  */
 void clear_cpu_tree(void)
 {
-	GList *item;
-	struct topo_obj *cpu;
-	struct topo_obj *cache_domain;
-	struct topo_obj *package;
+	g_list_free_full(packages, free_cpu_topo);
+	packages = NULL;
 
-	while (packages) {
-		item = g_list_first(packages);
-		package = item->data;
-		g_list_free(package->children);
-		g_list_free(package->interrupts);
-		g_list_free(package->numa_nodes);
-		free(package);
-		packages = g_list_delete_link(packages, item);
-	}
-	package_count = 0;
-
-	while (cache_domains) {
-		item = g_list_first(cache_domains);
-		cache_domain = item->data;
-		g_list_free(cache_domain->children);
-		g_list_free(cache_domain->interrupts);
-		g_list_free(cache_domain->numa_nodes);
-		free(cache_domain);
-		cache_domains = g_list_delete_link(cache_domains, item);
-	}
+	g_list_free_full(cache_domains, free_cpu_topo);
+	cache_domains = NULL;
 	cache_domain_count = 0;
 
-
-	while (cpus) {
-		item = g_list_first(cpus);
-		cpu = item->data;
-		g_list_free(cpu->interrupts);
-		free(cpu);
-		cpus = g_list_delete_link(cpus, item);
-	}
-	core_count = 0;
-
+	g_list_free_full(cpus, free_cpu_topo);
+	cpus = NULL;
+	cpus_clear(cpu_online_map);
 }
 
 static gint compare_cpus(gconstpointer a, gconstpointer b)

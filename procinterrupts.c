@@ -161,7 +161,7 @@ GList* collect_full_irq_list()
 		return NULL;
 
 	/* first line is the header we don't need; nuke it */
-	if (getline(&line, &size, file)==0) {
+	if (getline(&line, &size, file)<=0) {
 		free(line);
 		fclose(file);
 		return NULL;
@@ -174,7 +174,7 @@ GList* collect_full_irq_list()
 		char *c;
 		char *savedline = NULL;
 
-		if (getline(&line, &size, file)==0)
+		if (getline(&line, &size, file)<=0)
 			break;
 
 		/* lines with letters in front are special, like NMI count. Ignore */
@@ -182,13 +182,15 @@ GList* collect_full_irq_list()
 		while (isblank(*(c)))
 			c++;
 
-		if (!(*c>='0' && *c<='9'))
+		if (!isdigit(*c))
 			break;
 		c = strchr(line, ':');
 		if (!c)
 			continue;
 
 		savedline = strdup(line);
+		if (!savedline)
+			break;
 		irq_name = strtok_r(savedline, " ", &savedptr);
 		if (strstr(irq_name, "xen-dyn") != NULL)
 			is_xen_dyn = 1;
@@ -210,10 +212,9 @@ GList* collect_full_irq_list()
 		irq_mod = last_token;
 
 		*c = 0;
-		c++;
 		number = strtoul(line, NULL, 10);
 
-		info = calloc(sizeof(struct irq_info), 1);
+		info = calloc(1, sizeof(struct irq_info));
 		if (info) {
 			info->irq = number;
 			if (strstr(irq_name, "-event") != NULL && is_xen_dyn == 1) {
@@ -227,7 +228,7 @@ GList* collect_full_irq_list()
 				info->class = IRQ_OTHER;
 #endif
 			}
-			info->name = strdupa(irq_mod);
+			info->name = strdup(irq_mod);
 			tmp_list = g_list_append(tmp_list, info);
 		}
 		free(savedline);
@@ -248,7 +249,7 @@ void parse_proc_interrupts(void)
 		return;
 
 	/* first line is the header we don't need; nuke it */
-	if (getline(&line, &size, file)==0) {
+	if (getline(&line, &size, file)<=0) {
 		free(line);
 		fclose(file);
 		return;
@@ -260,9 +261,8 @@ void parse_proc_interrupts(void)
 		uint64_t count;
 		char *c, *c2;
 		struct irq_info *info;
-		char savedline[1024];
 
-		if (getline(&line, &size, file)==0)
+		if (getline(&line, &size, file)<=0)
 			break;
 
 		if (!proc_int_has_msi)
@@ -274,13 +274,11 @@ void parse_proc_interrupts(void)
 		while (isblank(*(c)))
 			c++;
 			
-		if (!(*c>='0' && *c<='9'))
+		if (!isdigit(*c))
 			break;
 		c = strchr(line, ':');
 		if (!c)
 			continue;
-
-		strncpy(savedline, line, sizeof(savedline)-1);
 
 		*c = 0;
 		c++;
@@ -305,7 +303,7 @@ void parse_proc_interrupts(void)
 			c=c2;
 			cpunr++;
 		}
-		if (cpunr != core_count) {
+		if (cpunr != num_online_cpus()) {
 			need_rescan = 1;
 			break;
 		}
@@ -444,7 +442,7 @@ void parse_proc_stat(void)
 	}
 
 	/* first line is the header we don't need; nuke it */
-	if (getline(&line, &size, file)==0) {
+	if (getline(&line, &size, file)<=0) {
 		free(line);
 		log(TO_ALL, LOG_WARNING, "WARNING read /proc/stat. balancing is broken\n");
 		fclose(file);
@@ -453,7 +451,7 @@ void parse_proc_stat(void)
 
 	cpucount = 0;
 	while (!feof(file)) {
-		if (getline(&line, &size, file)==0)
+		if (getline(&line, &size, file)<=0)
 			break;
 
 		if (!strstr(line, "cpu"))

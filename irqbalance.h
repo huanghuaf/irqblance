@@ -29,9 +29,8 @@
 #include <systemd/sd-journal.h>
 #endif
 
-extern int package_count;
-extern int cache_domain_count;
-extern int core_count;
+#define	NUMA_NO_NODE (-1)
+
 extern char *classes[];
 
 extern void parse_cpu_tree(void);
@@ -52,6 +51,7 @@ void dump_tree(void);
 
 void activate_mappings(void);
 void clear_cpu_tree(void);
+void free_cpu_topo(gpointer data);
 
 /*===================NEW BALANCER FUNCTIONS============================*/
 
@@ -69,6 +69,7 @@ extern int debug_mode;
 extern int journal_logging;
 extern int one_shot_mode;
 extern int need_rescan;
+extern int need_rebuild;
 extern unsigned long long cycle_count;
 extern unsigned long power_thresh;
 extern unsigned long deepest_cache;
@@ -159,6 +160,9 @@ extern unsigned int log_mask;
 
 #define SOCKET_PATH "irqbalance"
 #define SOCKET_TMPFS "/run/irqbalance/"
+
+extern int process_one_line(char *path, void (*cb)(char *line, void *data), void *data);
+extern void get_mask_from_bitmap(char *line, void *mask);
 
 #endif /* __INCLUDE_GUARD_IRQBALANCE_H_ */
 

@@ -275,7 +275,7 @@ static void add_banned_irq(int irq, GList **list)
 	if (entry)
 		return;
 
-	new = calloc(sizeof(struct irq_info), 1);
+	new = calloc(1, sizeof(struct irq_info));
 	if (!new) {
 		log(TO_CONSOLE, LOG_WARNING, "No memory to ban irq %d\n", irq);
 		return;
@@ -350,10 +350,7 @@ static struct irq_info *add_one_irq_to_db(const char *devpath, struct irq_info *
 	int numa_node;
 	char path[PATH_MAX];
 	FILE *fd;
-	char *lcpu_mask;
 	GList *entry;
-	ssize_t ret;
-	size_t blen;
 
 	/*
 	 * First check to make sure this isn't a duplicate entry
@@ -369,7 +366,7 @@ static struct irq_info *add_one_irq_to_db(const char *devpath, struct irq_info *
 		return NULL;
 	}
 
-	new = calloc(sizeof(struct irq_info), 1);
+	new = calloc(1, sizeof(struct irq_info));
 	if (!new)
 		return NULL;
 
@@ -394,8 +391,8 @@ static struct irq_info *add_one_irq_to_db(const char *devpath, struct irq_info *
 		new->level = map_class_to_level[new->class];
 
 get_numa_node:
-	numa_node = -1;
-	if (numa_avail) {
+	numa_node = NUMA_NO_NODE;
+	if (devpath != NULL && numa_avail) {
 		sprintf(path, "%s/numa_node", devpath);
 		fd = fopen(path, "r");
 		if (fd) {
@@ -409,23 +406,12 @@ get_numa_node:
 	else
 		new->numa_node = get_numa_node(numa_node);
 
-	sprintf(path, "%s/local_cpus", devpath);
-	fd = fopen(path, "r");
-	if (!fd) {
-		cpus_setall(new->cpumask);
-		goto out;
+	cpus_setall(new->cpumask);
+	if (devpath != NULL) {
+		sprintf(path, "%s/local_cpus", devpath);
+		process_one_line(path, get_mask_from_bitmap, &new->cpumask);
 	}
-	lcpu_mask = NULL;
-	ret = getline(&lcpu_mask, &blen, fd);
-	fclose(fd);
-	if (ret <= 0) {
-		cpus_setall(new->cpumask);
-	} else {
-		cpumask_parse_user(lcpu_mask, ret, new->cpumask);
-	}
-	free(lcpu_mask);
 
-out:
 	log(TO_CONSOLE, LOG_INFO, "Adding IRQ %d to database\n", irq);
 	return new;
 }
@@ -583,6 +569,7 @@ static void get_irq_user_policy(char *path, int irq, struct user_irq_policy *pol
 					break;
 				}
 			}
+			closedir(poldir);
 		}
 	}
 }
@@ -599,7 +586,7 @@ static int check_for_module_ban(char *name)
 		return 0;
 }
 
-static int check_for_irq_ban(char *path __attribute__((unused)), int irq, GList *proc_interrupts)
+static int check_for_irq_ban(int irq, GList *proc_interrupts)
 {
 	struct irq_info find, *res;
 	GList *entry;
@@ -658,7 +645,7 @@ static void build_one_dev_entry(const char *dirname, GList *tmp_irqs)
 				if (new)
 					continue;
 				get_irq_user_policy(devpath, irqnum, &pol);
-				if ((pol.ban == 1) || (check_for_irq_ban(devpath, irqnum, tmp_irqs))) {
+				if ((pol.ban == 1) || (check_for_irq_ban(irqnum, tmp_irqs))) {
 					add_banned_irq(irqnum, &banned_irqs);
 					continue;
 				}
@@ -693,7 +680,7 @@ static void build_one_dev_entry(const char *dirname, GList *tmp_irqs)
 		if (new)
 			goto done;
 		get_irq_user_policy(devpath, irqnum, &pol);
-		if ((pol.ban == 1) || (check_for_irq_ban(path, irqnum, tmp_irqs))) {
+		if ((pol.ban == 1) || (check_for_irq_ban(irqnum, tmp_irqs))) {
 			add_banned_irq(irqnum, &banned_irqs);
 			goto done;
 		}
@@ -731,7 +718,6 @@ void free_cl_opts(void)
 {
 	g_list_free_full(cl_banned_modules, free);
 	g_list_free_full(cl_banned_irqs, free);
-	g_list_free(banned_irqs);
 }
 
 static void add_new_irq(int irq, struct irq_info *hint, GList *proc_interrupts)
@@ -745,7 +731,7 @@ static void add_new_irq(int irq, struct irq_info *hint, GList *proc_interrupts)
 
 	/* Set NULL devpath for the irq has no sysfs entries */
 	get_irq_user_policy(NULL, irq, &pol);
-	if ((pol.ban == 1) || check_for_irq_ban(NULL, irq, proc_interrupts)) { /*FIXME*/
+	if ((pol.ban == 1) || check_for_irq_ban(irq, proc_interrupts)) { /*FIXME*/
 		add_banned_irq(irq, &banned_irqs);
 		new = get_irq_info(irq);
 	} else
@@ -757,13 +743,18 @@ static void add_new_irq(int irq, struct irq_info *hint, GList *proc_interrupts)
 
 static void add_missing_irq(struct irq_info *info, void *attr)
 {
-	struct irq_info *lookup = get_irq_info(info->irq);
 	GList *proc_interrupts = (GList *) attr;
 
-	if (!lookup)
-		add_new_irq(info->irq, info, proc_interrupts);
+	add_new_irq(info->irq, info, proc_interrupts);
 }
 
+static void free_tmp_irqs(gpointer data)
+{
+	struct irq_info *info = data;
+
+	free(info->name);
+	free(info);
+}
 
 void rebuild_irq_db(void)
 {
@@ -793,7 +784,7 @@ void rebuild_irq_db(void)
 
 	for_each_irq(tmp_irqs, add_missing_irq, interrupts_db);
 
-	g_list_free_full(tmp_irqs, free);
+	g_list_free_full(tmp_irqs, free_tmp_irqs);
 
 }
 
